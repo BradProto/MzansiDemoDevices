@@ -15,7 +15,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 API_URL = "https://devices.mzansisense.co.za"
@@ -219,18 +218,22 @@ def main():
     started = time.monotonic()
     deadline = started + args.duration_minutes * 60 if args.duration_minutes else math.inf
     next_tick = started
-    logging.info("Sending for both stores every 60 seconds; production alerts may fire")
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        while not STOP.is_set() and time.monotonic() < deadline:
-            stamp = datetime.now(timezone.utc)
-            futures = [pool.submit(send_one, store, kind, stamp) for store, kind in devices]
-            successes = sum(future.result() for future in futures)
+    logging.info("Sending one device at a time, at least 5 seconds between starts; production alerts may fire")
+    index = 0
+    successes = 0
+    while not STOP.is_set() and time.monotonic() < deadline:
+        # Schedule from the actual start: slow requests never cause catch-up bursts.
+        request_started = time.monotonic()
+        store, kind = devices[index]
+        stamp = datetime.now(timezone.utc)
+        successes += bool(send_one(store, kind, stamp))
+        index += 1
+        if index == len(devices):
             logging.info("Cycle complete: %s/%s devices accepted", successes, len(devices))
-            # Skip missed slots rather than replaying old readings after a delay.
-            next_tick += 60
-            while next_tick < time.monotonic():
-                next_tick += 60
-            STOP.wait(max(0, min(next_tick, deadline) - time.monotonic()))
+            index = 0
+            successes = 0
+        next_tick = request_started + 5
+        STOP.wait(max(0, min(next_tick, deadline) - time.monotonic()))
     logging.info("Stopped")
 
 
