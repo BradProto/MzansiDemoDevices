@@ -2,14 +2,18 @@
 
 Preview: python stores_live_private.py
 Run continuously: python -u stores_live_private.py --send
-Run two hours: python -u stores_live_private.py --send --duration-minutes 120
-Contains production device keys; share privately. No historical writes.
+Each device reports every 10 minutes.
+Across both stores, 1 or 2 fridge/freezer units have one 10-minute warm spell
+per day, then resume normal readings. Daily selections
+survive restarts; failed sends are not replayed. No historical writes.
+Contains production device keys; share privately.
 """
 
 import argparse
 import json
 import logging
 import math
+import random
 import signal
 import threading
 import time
@@ -19,6 +23,9 @@ from datetime import datetime, timedelta, timezone
 
 API_URL = "https://devices.mzansisense.co.za"
 STOP = threading.Event()
+READING_INTERVAL_SECONDS = 10 * 60
+START_SPACING_SECONDS = 5
+LOCAL_TIMEZONE = timezone(timedelta(hours=2))
 KEYS = {
     "SSS1": {
         "doors": "XamF_3CVLW0ykrKqwa0ytU1WOYTvuZ6CES7VqhOChkc",
@@ -56,18 +63,43 @@ DEVICE_IDS = {
 }
 
 
+def daily_faults(stamp):
+    """Choose at most two physical temperature units across both stores per day.
+
+    A date-seeded local RNG keeps the plan stable across restarts without a
+    state file. Each chosen unit gets exactly one local 10-minute slot; slots
+    exclude midnight so the next normal sample belongs to the same day.
+    """
+    local = stamp.astimezone(LOCAL_TIMEZONE)
+    rng = random.Random("mzansi-normal-operation-v1:" + local.date().isoformat())
+    units = [(store, kind, i)
+             for store in DEVICE_IDS
+             for kind, count in (("fridges", 10), ("freezers", 6))
+             for i in range(1, count + 1)]
+    return {unit: rng.randrange(1, 143)
+            for unit in rng.sample(units, rng.randint(1, 2))}
+
+
+def temperature_excursion(store, kind, unit, stamp):
+    """Return a brief warm excursion, followed by normal values next slot."""
+    local = stamp.astimezone(LOCAL_TIMEZONE)
+    slot = (local.hour * 60 + local.minute) // 10
+    if daily_faults(stamp).get((store, kind, unit)) == slot:
+        return 6.0 if kind == "fridges" else 10.0
+    return 0.0
+
+
 def values_sss1(kind, stamp, elapsed_minutes):
-    """Return typed tag values using South African hours and repeatable cycles.
+    """Return typed tag values using South African hours and normal operating cycles.
 
     Door true means open; motion true means activity. Solar battery power is
     positive on discharge, negative on charge; grid power is positive on import.
-    Freezer 6 has periodic reporting gaps, not whole-device offline status.
+    All temperature units report continuously, including during a brief fault.
     """
-    local = stamp + timedelta(hours=2)
+    local = stamp.astimezone(LOCAL_TIMEZONE)
     hour = local.hour + local.minute / 60
     opened = 7 <= hour < 20
     minute = int(stamp.timestamp() // 60)
-    cycle = elapsed_minutes % 60
     if kind == "doors":
         return {f"door_{i}": bool(opened and minute % period < duration)
                 for i, period, duration in [(1, 7, 2), (2, 53, 8), (3, 23, 2), (4, 41, 1)]}
@@ -75,12 +107,9 @@ def values_sss1(kind, stamp, elapsed_minutes):
         result = {}
         count = 10 if kind == "fridges" else 6
         for i in range(1, count + 1):
-            if kind == "freezers" and i == 6 and 35 <= cycle < 45:
-                continue
             wave = math.sin(minute / 9 + i)
-            warm = max(0, 1 - abs(cycle - (20 if i == 1 else 45)) / 10)
             base = 3.2 + i * .08 if kind == "fridges" else -21 + i * .15
-            excursion = (9 if kind == "fridges" else 13) * warm if i <= 2 else 0
+            excursion = temperature_excursion("SSS1", kind, i, stamp)
             tag = i if kind == "fridges" else i + 10
             result[f"temp_{tag}"] = round(base + .6 * wave + excursion, 2)
         return result
@@ -102,17 +131,16 @@ def values_sss1(kind, stamp, elapsed_minutes):
 
 
 def values_sss2(kind, stamp, elapsed_minutes):
-    """Return typed tag values using South African hours and repeatable cycles.
+    """Return typed tag values using South African hours and normal operating cycles.
 
     Door true means open; motion true means activity. Solar battery power is
     positive on discharge, negative on charge; grid power is positive on import.
-    Freezer 6 has periodic reporting gaps, not whole-device offline status.
+    All temperature units report continuously, including during a brief fault.
     """
-    local = stamp + timedelta(hours=2)
+    local = stamp.astimezone(LOCAL_TIMEZONE)
     hour = local.hour + local.minute / 60
     opened = 7 <= hour < 20
     minute = int(stamp.timestamp() // 60)
-    cycle = elapsed_minutes % 60
     if kind == "doors":
         return {f"door{i}": bool(opened and minute % period < duration)
                 for i, period, duration in [(2, 7, 2), (4, 53, 8), (3, 23, 2), (1, 41, 1)]}
@@ -120,12 +148,9 @@ def values_sss2(kind, stamp, elapsed_minutes):
         result = {}
         count = 10 if kind == "fridges" else 6
         for i in range(1, count + 1):
-            if kind == "freezers" and i == 6 and 35 <= cycle < 45:
-                continue
             wave = math.sin(minute / 9 + i)
-            warm = max(0, 1 - abs(cycle - (20 if i == 1 else 45)) / 10)
             base = 3.2 + i * .08 if kind == "fridges" else -21 + i * .15
-            excursion = (9 if kind == "fridges" else 13) * warm if i <= 2 else 0
+            excursion = temperature_excursion("SSS2", kind, i, stamp)
             tag = i if kind == "fridges" else i + 10
             result[f"temp{tag}"] = round(base + .6 * wave + excursion, 2)
         return result
@@ -154,8 +179,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def payload(store, kind, stamp):
-    """Build current UTC readings with independent Store 2 anomaly timing."""
-    phase = int(stamp.timestamp() // 60) + (17 if store == "SSS2" else 0)
+    """Build current UTC readings using the shared daily fault plan."""
+    phase = int(stamp.timestamp() // 60)
     generator = values_sss1 if store == "SSS1" else values_sss2
     return {"readings": [
         {"tag_name": tag, "value": value, "recorded_at": stamp.isoformat()}
@@ -217,23 +242,25 @@ def main():
         signal.signal(signum, lambda *_: STOP.set())
     started = time.monotonic()
     deadline = started + args.duration_minutes * 60 if args.duration_minutes else math.inf
-    next_tick = started
-    logging.info("Sending one device at a time, at least 5 seconds between starts; production alerts may fire")
-    index = 0
-    successes = 0
+    # Each device has its own due time so a full pass cannot turn into minute
+    # reporting. Scheduling from actual starts also avoids catch-up bursts.
+    due = {device: started + i * START_SPACING_SECONDS
+           for i, device in enumerate(devices)}
+    next_start = started
+    logging.info("Sending each device every 10 minutes; starts at least 5 seconds apart")
     while not STOP.is_set() and time.monotonic() < deadline:
-        # Schedule from the actual start: slow requests never cause catch-up bursts.
+        device = min(devices, key=due.get)
+        wake_at = max(due[device], next_start)
+        STOP.wait(max(0, min(wake_at, deadline) - time.monotonic()))
+        if STOP.is_set() or time.monotonic() >= deadline:
+            break
         request_started = time.monotonic()
-        store, kind = devices[index]
+        store, kind = device
         stamp = datetime.now(timezone.utc)
-        successes += bool(send_one(store, kind, stamp))
-        index += 1
-        if index == len(devices):
-            logging.info("Cycle complete: %s/%s devices accepted", successes, len(devices))
-            index = 0
-            successes = 0
-        next_tick = request_started + 5
-        STOP.wait(max(0, min(next_tick, deadline) - time.monotonic()))
+        accepted = send_one(store, kind, stamp)
+        logging.info("%s %s: %s", store, kind, "accepted" if accepted else "failed")
+        due[device] = request_started + READING_INTERVAL_SECONDS
+        next_start = request_started + START_SPACING_SECONDS
     logging.info("Stopped")
 
 
